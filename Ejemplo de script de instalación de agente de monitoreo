@@ -1,0 +1,158 @@
+#!/bin/bash
+# ==============================================================================
+# Script de Instalación del Agente Mantishield para Linux
+#
+# Uso: ./install_mantishield.sh TU_TOKEN_DE_CLIENTE
+#
+# Este script realiza las siguientes acciones:
+# 1. Verifica los permisos y el token de cliente.
+# 2. Crea un directorio de instalación en /opt/mantishield.
+# 3. Crea el script del agente (agent.py) que escanea los entornos de Conda.
+# 4. Establece un cron job para ejecutar el agente diariamente.
+# ==============================================================================
+
+# Detener el script si ocurre un error
+set -e
+
+# --- Variables de Configuración ---
+INSTALL_DIR="/opt/mantishield"
+AGENT_SCRIPT="$INSTALL_DIR/agent.py"
+API_ENDPOINT="https://api.mantishield.com/v1/ingest"
+CLIENT_TOKEN="$1"
+
+# --- Funciones Auxiliares ---
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+    exit 1
+}
+
+# --- Inicio del Script de Instalación ---
+log_info "Iniciando la instalación del Agente Mantishield..."
+
+# 1. Verificaciones Iniciales
+if [ "$(id -u)" -ne 0 ]; then
+    log_error "Este script debe ser ejecutado con privilegios de superusuario (sudo)."
+fi
+
+if [ -z "$CLIENT_TOKEN" ]; then
+    log_error "No se proporcionó un token de cliente. Uso: $0 <TU_TOKEN>"
+fi
+
+# 2. Creación del Directorio
+log_info "Creando el directorio de instalación en $INSTALL_DIR..."
+mkdir -p "$INSTALL_DIR"
+
+# 3. Creación del Script del Agente (agent.py)
+# En un escenario real, este archivo se descargaría desde un servidor seguro.
+# Para este ejemplo, lo creamos directamente aquí.
+log_info "Creando el script del agente en $AGENT_SCRIPT..."
+
+cat << 'EOF' > "$AGENT_SCRIPT"
+#!/usr/bin/env python3
+# Agente de recolección de paquetes de Conda para Mantishield
+import os
+import json
+import subprocess
+import requests # Nota: se asume que requests está disponible o se instala.
+
+# --- Configuración del Agente ---
+API_ENDPOINT = "__API_ENDPOINT__"
+CLIENT_TOKEN = "__CLIENT_TOKEN__"
+
+def find_conda_environments():
+    """Encuentra las rutas de los entornos de Conda."""
+    try:
+        # Busca la ruta base de conda
+        result = subprocess.run(['conda', 'info', '--base'], capture_output=True, text=True, check=True)
+        conda_base_path = result.stdout.strip()
+        envs_path = os.path.join(conda_base_path, 'envs')
+        # Lista los directorios dentro de la carpeta de entornos
+        environments = [os.path.join(envs_path, d) for d in os.listdir(envs_path) if os.path.isdir(os.path.join(envs_path, d))]
+        # Añade el entorno base
+        environments.append(conda_base_path)
+        return environments
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: No se pudo encontrar Conda o ejecutar el comando 'conda'.")
+        return []
+
+def get_conda_packages(env_path):
+    """Obtiene la lista de paquetes de un entorno de Conda específico."""
+    try:
+        # Usamos el path del python del entorno para asegurar el contexto correcto
+        python_executable = os.path.join(env_path, 'bin', 'python')
+        if not os.path.exists(python_executable):
+            python_executable = 'python' # Fallback al python del sistema
+
+        # Ejecuta 'conda list' en el entorno y obtiene la salida en formato JSON
+        result = subprocess.run(
+            ['conda', 'list', '-p', env_path, '--json'],
+            capture_output=True, text=True, check=True
+        )
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"No se pudo analizar el entorno {env_path}: {e}")
+        return None
+
+def main():
+    """Función principal del agente."""
+    print("MANTISHIELD AGENT: Iniciando escaneo de paquetes...")
+    all_packages = []
+    environments = find_conda_environments()
+
+    for env in environments:
+        print(f"Analizando entorno: {env}")
+        packages = get_conda_packages(env)
+        if packages:
+            all_packages.append({"environment": os.path.basename(env), "packages": packages})
+    
+    if not all_packages:
+        print("No se encontraron paquetes para reportar.")
+        return
+
+    # Prepara los datos para enviar a la API
+    payload = {
+        "hostname": os.uname().nodename,
+        "os": "linux",
+        "data": all_packages
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {CLIENT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        print(f"Enviando {len(all_packages)} reporte(s) de entorno(s) a la API de Mantishield...")
+        response = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=30)
+        response.raise_for_status() # Lanza un error si la respuesta es 4xx o 5xx
+        print("Reporte enviado exitosamente.")
+    except requests.RequestException as e:
+        print(f"Error al enviar el reporte a la API: {e}")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# Reemplaza los placeholders en el script del agente con los valores reales
+sed -i "s|__API_ENDPOINT__|${API_ENDPOINT}|g" "$AGENT_SCRIPT"
+sed -i "s|__CLIENT_TOKEN__|${CLIENT_TOKEN}|g" "$AGENT_SCRIPT"
+
+# Dar permisos de ejecución al script del agente
+chmod +x "$AGENT_SCRIPT"
+
+# 4. Configuración del Cron Job para Ejecución Diaria
+log_info "Configurando la tarea programada (cron job) para ejecución diaria..."
+CRON_JOB="0 3 * * * root $AGENT_SCRIPT >> $INSTALL_DIR/agent.log 2>&1"
+echo "$CRON_JOB" > /etc/cron.d/mantishield-agent
+
+log_info "--------------------------------------------------------"
+log_info "¡Instalación del Agente Mantishield completada!"
+log_info "El agente se ejecutará automáticamente todos los días a las 3:00 AM."
+log_info "Los logs de ejecución se guardarán en $INSTALL_DIR/agent.log"
+log_info "--------------------------------------------------------"
+
+exit 0
